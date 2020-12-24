@@ -14,63 +14,74 @@
 
 import argparse
 import os
+import sys
+__dir__ = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(__dir__)
+sys.path.append(os.path.abspath(os.path.join(__dir__, '..')))
+
 from ppcls.modeling import architectures
-
-import paddle.fluid as fluid
-import paddle_serving_client.io as serving_io
-
+from ppcls.utils.save_load import load_dygraph_pretrain
+import paddle
+import paddle.nn.functional as F
+from paddle.jit import to_static
+from paddle_serving_client.io import inference_model_to_serving
 
 def parse_args():
+    def str2bool(v):
+        return v.lower() in ("true", "t", "1")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--model", type=str)
     parser.add_argument("-p", "--pretrained_model", type=str)
-    parser.add_argument("-o", "--output_path", type=str, default="")
+    parser.add_argument(
+        "-o", "--output_path", type=str, default="./inference/cls_infer")
     parser.add_argument("--class_dim", type=int, default=1000)
+    parser.add_argument("--load_static_weights", type=str2bool, default=False)
     parser.add_argument("--img_size", type=int, default=224)
 
     return parser.parse_args()
 
 
-def create_input(img_size=224):
-    image = fluid.data(
-        name='image', shape=[None, 3, img_size, img_size], dtype='float32')
-    return image
+class Net(paddle.nn.Layer):
+    def __init__(self, net, class_dim, model):
+        super(Net, self).__init__()
+        self.pre_net = net(class_dim=class_dim)
+        self.model = model
 
-
-def create_model(args, model, input, class_dim=1000):
-    if args.model == "GoogLeNet":
-        out, _, _ = model.net(input=input, class_dim=class_dim)
-    else:
-        out = model.net(input=input, class_dim=class_dim)
-        out = fluid.layers.softmax(out)
-    return out
+    def forward(self, inputs):
+        x = self.pre_net(inputs)
+        if self.model == "GoogLeNet":
+            x = x[0]
+        x = F.softmax(x)
+        return x
 
 
 def main():
     args = parse_args()
 
-    model = architectures.__dict__[args.model]()
+    net = architectures.__dict__[args.model]
+    model = Net(net, args.class_dim, args.model)
+    load_dygraph_pretrain(
+        model.pre_net,
+        path=args.pretrained_model,
+        load_static_weights=args.load_static_weights)
+    model.eval()
 
-    place = fluid.CPUPlace()
-    exe = fluid.Executor(place)
-
-    startup_prog = fluid.Program()
-    infer_prog = fluid.Program()
-
-    with fluid.program_guard(infer_prog, startup_prog):
-        with fluid.unique_name.guard():
-            image = create_input(args.img_size)
-            out = create_model(args, model, image, class_dim=args.class_dim)
-
-    infer_prog = infer_prog.clone(for_test=True)
-    fluid.load(
-        program=infer_prog, model_path=args.pretrained_model, executor=exe)
-
-    model_path = os.path.join(args.output_path, "ppcls_model")
-    conf_path = os.path.join(args.output_path, "ppcls_client_conf")
-    serving_io.save_model(model_path, conf_path, {"image": image},
-                          {"prediction": out}, infer_prog)
-
+    model = to_static(
+        model,
+        input_spec=[
+            paddle.static.InputSpec(
+                shape=[None, 3, args.img_size, args.img_size], dtype='float32')
+        ])
+    paddle.jit.save(model, "{}/tmp".format(args.output_path))
+    inference_model_dir = "{}".format(args.output_path)
+    serving_client_dir = "{}/serving_client_dir".format(args.output_path)
+    serving_server_dir = "{}/serving_client_dir".format(args.output_path)
+    model_filename="tmp.pdmodel".format(args.output_path)
+    params_filename="tmp.pdiparams".format(args.output_path)
+    inference_model_to_serving(inference_model_dir, serving_server_dir, 
+                               serving_client_dir, model_filename, params_filename)
+    os.remove("{}/tmp.*")
 
 if __name__ == "__main__":
     main()
